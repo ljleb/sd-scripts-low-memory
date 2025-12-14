@@ -5,6 +5,7 @@ venv
 *.egg-info
 build
 .vscode
+.idea
 wandb
 CLAUDE.md
 GEMINI.md

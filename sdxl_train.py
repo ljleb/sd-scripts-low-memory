@@ -1,6 +1,7 @@
 # training with captions
 
 import argparse
+import gc
 import math
 import os
 from multiprocessing import Value
@@ -11,7 +12,7 @@ from tqdm import tqdm
 
 import torch
 from library.device_utils import init_ipex, clean_memory_on_device
-
+from lora_pre import Fp8RefreshScheduler
 
 init_ipex()
 
@@ -47,6 +48,14 @@ from library.sdxl_original_unet import SdxlUNet2DConditionModel
 
 
 UNET_NUM_BLOCKS_FOR_BLOCK_LR = 23
+
+
+def debug_cuda_memory():
+    import gc
+    torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+    return torch.cuda.memory_allocated("cuda:0")
 
 
 def get_block_params_to_optimize(unet: SdxlUNet2DConditionModel, block_lrs: List[float]) -> List[dict]:
@@ -343,6 +352,18 @@ def train(args):
         training_models.append(text_encoder2)
         params_to_optimize.append({"params": list(text_encoder2.parameters()), "lr": args.learning_rate_te2 or args.learning_rate})
 
+    # patch_handles = []
+    if args.optimizer_type.lower().endswith("AdamLoraPre".lower()):
+        from lora_pre import patch_model_lr
+        patch_handles = [
+            patch_model_lr(
+                model,
+                rank_ratio=getattr(args, "rank_ratio", 0.05),
+                sketches_ttl=getattr(args, "sketches_ttl", 200),
+            )
+            for model in training_models
+        ]
+
     # calculate number of trainable parameters
     n_params = 0
     for group in params_to_optimize:
@@ -458,6 +479,9 @@ def train(args):
         text_encoder1.text_model.encoder.layers[-1].requires_grad_(False)
         text_encoder1.text_model.final_layer_norm.requires_grad_(False)
 
+    fp8_refresher = None
+    optimizer.register_step_post_hook(lambda *args, **kwargs: fp8_refresher.step())
+
     if args.deepspeed:
         ds_model = deepspeed_utils.prepare_deepspeed_model(
             args,
@@ -472,14 +496,29 @@ def train(args):
         training_models = [ds_model]
 
     else:
+        base_mem = debug_cuda_memory()
+
         # acceleratorがなんかよろしくやってくれるらしい
         if train_unet:
             unet = accelerator.prepare(unet)
+        mem_unet = debug_cuda_memory() - base_mem
+
         if train_text_encoder1:
             text_encoder1 = accelerator.prepare(text_encoder1)
+        mem_te1 = debug_cuda_memory() - (mem_unet + base_mem)
+
         if train_text_encoder2:
             text_encoder2 = accelerator.prepare(text_encoder2)
-        optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
+        mem_te2 = debug_cuda_memory() - (mem_unet + mem_te1 + base_mem)
+
+        optimizer = accelerator.prepare(optimizer)
+        mem_optimizer = debug_cuda_memory() - (mem_unet + mem_te1 + mem_te2 + base_mem)
+
+        train_dataloader = accelerator.prepare(train_dataloader)
+        mem_train_dataloader = debug_cuda_memory() - (mem_unet + mem_te1 + mem_te2 + mem_optimizer + base_mem)
+
+        lr_scheduler = accelerator.prepare(lr_scheduler)
+        mem_lr_scheduler = debug_cuda_memory() - (mem_unet + mem_te1 + mem_te2 + mem_optimizer + mem_train_dataloader + base_mem)
 
     # TextEncoderの出力をキャッシュするときにはCPUへ移動する
     if args.cache_text_encoder_outputs:
@@ -491,6 +530,17 @@ def train(args):
         # make sure Text Encoders are on GPU
         text_encoder1.to(accelerator.device)
         text_encoder2.to(accelerator.device)
+
+    for m in (unet, text_encoder1, text_encoder2):
+        for p_name, p in m.named_parameters():
+            if hasattr(p, "cpu_fp16"):
+                p.data = p.data.to(dtype=torch.float8_e4m3fnuz)
+
+    torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    fp8_refresher = Fp8RefreshScheduler((*unet.parameters(), *text_encoder1.parameters(), *text_encoder2.parameters()), args.cpu_refresh_ttl)
 
     # 実験的機能：勾配も含めたfp16学習を行う　PyTorchにパッチを当ててfp16でのgrad scaleを有効にする
     if args.full_fp16:
@@ -602,6 +652,9 @@ def train(args):
 
     loss_recorder = train_util.LossRecorder()
     for epoch in range(num_train_epochs):
+        gc.collect()
+        torch.cuda.empty_cache()
+
         accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
         current_epoch.value = epoch + 1
 
@@ -631,7 +684,7 @@ def train(args):
                 if "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
                     input_ids1 = batch["input_ids"]
                     input_ids2 = batch["input_ids2"]
-                    with torch.set_grad_enabled(args.train_text_encoder):
+                    with accelerator.autocast(), torch.set_grad_enabled(args.train_text_encoder):
                         # Get the text embedding for conditioning
                         # TODO support weighted captions
                         # if args.weighted_captions:
@@ -738,7 +791,9 @@ def train(args):
                         noise_pred.float(), target.float(), reduction="mean", loss_type=args.loss_type, huber_c=huber_c
                     )
 
+                # mem_activations = debug_cuda_memory() - (mem_unet + mem_te1 + mem_te2 + mem_optimizer + mem_train_dataloader + mem_lr_scheduler + base_mem)
                 accelerator.backward(loss)
+                # mem_grads = debug_cuda_memory() - (mem_unet + mem_te1 + mem_te2 + mem_optimizer + mem_train_dataloader + mem_lr_scheduler + base_mem)
 
                 if not (args.fused_backward_pass or args.fused_optimizer_groups):
                     if accelerator.sync_gradients and args.max_grad_norm != 0.0:
@@ -864,10 +919,18 @@ def train(args):
 
     accelerator.end_training()
 
+    for h in patch_handles:
+        h.remove()
+
     if args.save_state or args.save_state_on_train_end:
         train_util.save_state_on_train_end(args, accelerator)
 
     del accelerator  # この後メモリを使うのでこれは消す
+
+    for m in (unet, text_encoder1, text_encoder2):
+        for p in m.parameters():
+            if hasattr(p, "cpu_fp16"):
+                p.data = p.cpu_fp16.to(p.device)
 
     if is_main_process:
         src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
@@ -939,6 +1002,23 @@ def setup_parser() -> argparse.ArgumentParser:
         default=None,
         help="number of optimizers for fused backward pass and optimizer step / fused backward passとoptimizer stepのためのoptimizer数",
     )
+
+    parser.add_argument(
+        "--rank_ratio",
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument(
+        "--sketches_ttl",
+        type=int,
+        default=200,
+    )
+    parser.add_argument(
+        "--cpu_refresh_ttl",
+        type=int,
+        default=200,
+    )
+
     return parser
 
 
