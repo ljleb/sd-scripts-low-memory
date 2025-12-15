@@ -106,7 +106,8 @@ class LowRankLinearFn(torch.autograd.Function):
         ctx.save_for_backward(sketch, weight)
         ctx.has_bias = bias is not None
 
-        output = torch.nn.functional.linear(input_tensor, weight.detach().to(weight.cpu_fp16.dtype), bias)
+        weight_fp16 = fp8_to_fp16_with_scale(weight.detach(), weight.fp8_scale)
+        output = torch.nn.functional.linear(input_tensor, weight_fp16, bias)
         return output
 
     @staticmethod
@@ -115,7 +116,8 @@ class LowRankLinearFn(torch.autograd.Function):
         sketch, weight = ctx.saved_tensors
         has_bias = ctx.has_bias
 
-        grad_input = grad_output @ weight.detach().to(weight.cpu_fp16.dtype)
+        weight_fp16 = fp8_to_fp16_with_scale(weight.detach(), weight.fp8_scale)
+        grad_input = grad_output @ weight_fp16
 
         reduce_dims = tuple(range(grad_output.ndim - 1))
         grad_bias = grad_output.sum(dim=reduce_dims) if has_bias else None
@@ -158,9 +160,10 @@ class LowRankConv2dFn(torch.autograd.Function):
         dilation,
         groups: int,
     ):
+        weight_fp16 = fp8_to_fp16_with_scale(weight.detach(), weight.fp8_scale)
         output = torch.nn.functional.conv2d(
             input_tensor,
-            weight.detach().to(weight.cpu_fp16.dtype),
+            weight_fp16,
             bias,
             stride=stride,
             padding=padding,
@@ -228,9 +231,10 @@ class LowRankConv2dFn(torch.autograd.Function):
 
         output_padding = (int(out_pad_h), int(out_pad_w))
 
+        weight_fp16 = fp8_to_fp16_with_scale(weight.detach(), weight.fp8_scale)
         grad_input = torch.nn.functional.conv_transpose2d(
             grad_output,
-            weight.detach().to(weight.cpu_fp16.dtype),
+            weight_fp16,
             bias=None,
             stride=stride,
             padding=padding,
@@ -482,6 +486,21 @@ class WorkerPool:
 
 
 class AdamLoraPre(Optimizer):
+    """
+    Adam on normal params.
+    For low-rank-sketch params (p.requires_grad_lr=True):
+      - g_sk = p.grad_lr  (out_dim x k)
+      - metric-correct via (P^T P)^-1 using Cholesky (fp32 only here)
+      - Adam in subspace (dtype = param dtype)
+      - apply update to weights via delta_w = delta_h @ P.T
+
+    Integrated refresh:
+      - maintains pinned CPU fp16 masters (p.cpu_fp16)
+      - periodically refreshes GPU fp8 params from CPU masters over a K-step cycle
+      - synchronizes refresh with any in-flight GPU->CPU master writes via a per-param Event
+      - uses a single global optimizer step counter (self.oft_step)
+    """
+
     def __init__(
         self,
         params: Iterable[torch.nn.Parameter],
@@ -493,24 +512,22 @@ class AdamLoraPre(Optimizer):
         cholesky_eps: float = 1e-4,
         max_grad_norm: Optional[float] = None,
         match_energy: bool = False,
+        cpu_refresh_ttl: int = 200,
+        refresh_seed: int = 0,
+        refresh_stream: Optional[torch.cuda.Stream] = None,
+        worker_device: str = "cuda:0",
+        num_workers: int = 8,
+        worker_queue_maxsize: int = 0,
     ):
         if eps <= 0.0:
             raise ValueError(f"Invalid eps: {eps}")
-
         beta1, beta2 = betas
         if not 0.0 <= beta1 < 1.0:
             raise ValueError("Invalid beta1")
         if not 0.0 <= beta2 < 1.0:
             raise ValueError("Invalid beta2")
 
-        gamma1 = math.sqrt(beta1)
-        gamma2 = beta2 ** 0.25
-        if not 0.0 <= gamma1 < 1.0:
-            raise ValueError("Invalid gamma1")
-        if not 0.0 <= gamma2 < 1.0:
-            raise ValueError("Invalid gamma2")
-
-        self.worker = WorkerPool("cuda:0", num_workers=8, maxsize=0)
+        self.worker = WorkerPool(worker_device, num_workers=num_workers, maxsize=worker_queue_maxsize)
 
         defaults = dict(
             lr=lr,
@@ -518,15 +535,24 @@ class AdamLoraPre(Optimizer):
             betas=betas,
             eps=eps,
             weight_decay=weight_decay,
-            gamma1=gamma1,
-            gamma2=gamma2,
             cholesky_eps=cholesky_eps,
             max_grad_norm=max_grad_norm,
             match_energy=match_energy,
+            refresh_K=cpu_refresh_ttl,
         )
         super().__init__(params, defaults)
 
-        # Initialize state
+        self.oft_step = 0
+
+        self._refresh_k = cpu_refresh_ttl
+        self._refresh_stream = refresh_stream if refresh_stream is not None else torch.cuda.Stream()
+        self._refresh_done = torch.cuda.Event()
+        self._refresh_gen = torch.Generator(device="cpu")
+        self._refresh_gen.manual_seed(refresh_seed)
+        self._refresh_cycle_step = 0
+        self._refresh_perm: list[int] = []
+        self._refresh_params: list[torch.nn.Parameter] = []
+
         for group in self.param_groups:
             group_rank_ratio = group["rank_ratio"]
 
@@ -535,11 +561,11 @@ class AdamLoraPre(Optimizer):
                     continue
 
                 state = self.state[p]
-                state["step"] = 0
 
                 lr_flag = getattr(p, "requires_grad_lr", False)
+                is_matrix = lr_flag and (p.dim() >= 2)
 
-                if lr_flag and p.dim() >= 2:
+                if is_matrix:
                     out_dim = p.shape[0]
                     in_dim = p.shape[1:].numel()
                     min_dim = min(out_dim, in_dim)
@@ -549,22 +575,124 @@ class AdamLoraPre(Optimizer):
                         r = max(int(min_dim * group_rank_ratio), 1)
                         r = min(r, min_dim)
 
+                    k = getattr(p, "lr_sketch_rank", r)
+
                     state["mode"] = 1
                     state["shape_2d"] = (out_dim, in_dim)
-                    state["rank"] = r
+                    state["sketch_rank"] = k
 
-                    device = p.device
-                    dtype = p.dtype
+                    state["exp_avg_lr"] = torch.zeros((out_dim, k), device=p.device, dtype=p.dtype)
+                    state["exp_avg_sq_lr"] = torch.zeros((out_dim, k), device=p.device, dtype=p.dtype)
 
-                    state["m_B"] = torch.zeros(out_dim, r, device=device, dtype=dtype)
-                    state["m_A"] = torch.randn(r, in_dim, device=device, dtype=dtype) * 0.02
-
-                    state["v_B"] = torch.zeros(out_dim, r, device=device, dtype=dtype)
-                    state["v_A"] = torch.randn(r, in_dim, device=device, dtype=dtype) * 0.02
+                    # event: set => CPU master is safe to read/copy; cleared => worker writing CPU master
+                    if hasattr(p, "cpu_fp16"):
+                        state["cpu_ready_evt"] = threading.Event()
+                        state["cpu_ready_evt"].set()
+                        self._refresh_params.append(p)
                 else:
                     state["mode"] = 0
                     state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
                     state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+
+        if self._refresh_params:
+            seen = set()
+            uniq = []
+            for p in self._refresh_params:
+                i = id(p)
+                if i in seen:
+                    continue
+                seen.add(i)
+                uniq.append(p)
+            self._refresh_params = uniq
+
+        self._refresh_n = len(self._refresh_params)
+        self._refresh_new_cycle()
+
+    def close(self):
+        self.worker.close()
+
+    def _refresh_new_cycle(self):
+        self._refresh_cycle_step = 0
+        if self._refresh_n == 0:
+            self._refresh_perm = []
+        else:
+            self._refresh_perm = torch.randperm(self._refresh_n, generator=self._refresh_gen).tolist()
+
+    def _refresh_pick_indices(self) -> list[int]:
+        if self._refresh_k <= 0 or self._refresh_n == 0:
+            return []
+        if self._refresh_cycle_step >= self._refresh_k:
+            self._refresh_new_cycle()
+
+        s = self._refresh_cycle_step
+        self._refresh_cycle_step += 1
+
+        start = (s * self._refresh_n) // self._refresh_k
+        end = ((s + 1) * self._refresh_n) // self._refresh_k
+        if start >= end:
+            return []
+        return self._refresh_perm[start:end]
+
+    def _refresh_from_cpu(self):
+        idxs = self._refresh_pick_indices()
+        if not idxs:
+            with torch.cuda.stream(self._refresh_stream):
+                pass
+            self._refresh_done.record(self._refresh_stream)
+            torch.cuda.current_stream().wait_event(self._refresh_done)
+            return
+
+        # host-side: ensure CPU master is not being written
+        for i in idxs:
+            p = self._refresh_params[i]
+            evt: threading.Event = self.state[p]["cpu_ready_evt"]
+            evt.wait()
+
+        with torch.cuda.stream(self._refresh_stream):
+            for i in idxs:
+                p = self._refresh_params[i]
+
+                # H2D + fp16->fp8 on GPU
+                w_fp16 = p.cpu_fp16.to(device=p.device, dtype=torch.float16, non_blocking=True)
+                w_fp8, scale = fp16_to_fp8_with_rescaling(
+                    w_fp16,
+                    out_device=p.device,
+                    axis_muliscale=True,
+                    scale_dim=0,
+                )
+                p.data.copy_(w_fp8, non_blocking=True)
+                p.fp8_scale = scale
+
+        self._refresh_done.record(self._refresh_stream)
+        torch.cuda.current_stream().wait_event(self._refresh_done)
+
+    @staticmethod
+    def _finish_in_subspace_update_and_signal(
+        producer_event,
+        p_cpu,
+        delta_w,          # (out_dim, in_dim) on GPU fp16
+        out_dim, in_dim,
+        lr: float,
+        weight_decay: float,
+        cpu_ready_evt: threading.Event,
+    ):
+        cpu_device = p_cpu.device
+
+        consumer_stream = torch.cuda.current_stream()
+        consumer_stream.wait_event(producer_event)
+
+        delta_w_cpu = delta_w.to(cpu_device)
+
+        done = torch.cuda.Event()
+        done.record(consumer_stream)
+        done.synchronize()
+
+        w_mat_cpu = p_cpu.data.view(out_dim, in_dim)
+        if weight_decay != 0.0:
+            w_mat_cpu.mul_(1.0 - lr * weight_decay)
+        w_mat_cpu.add_(delta_w_cpu)
+
+        cpu_ready_evt.set()
 
     @torch.no_grad()
     def step(self, closure: Optional[callable] = None):
@@ -573,212 +701,141 @@ class AdamLoraPre(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        self.oft_step += 1
+
         for group in self.param_groups:
             lr = group["lr"]
             beta1, beta2 = group["betas"]
-            gamma1 = group["gamma1"]
-            gamma2 = group["gamma2"]
             eps = group["eps"]
             weight_decay = group["weight_decay"]
             cholesky_eps = group["cholesky_eps"]
             max_grad_norm = group["max_grad_norm"]
             match_energy = group["match_energy"]
 
-            for p in group["params"]:
-                if p is None:
+            for param in group["params"]:
+                if param is None:
                     continue
 
-                state = self.state[p]
-                is_vector = state["mode"] == 0
+                st = self.state[param]
+                lr_flag = getattr(param, "requires_grad_lr", False)
 
-                lr_flag = getattr(p, "requires_grad_lr", False)
-
-                if not lr_flag:
-                    grad = p.grad
+                # -------- normal Adam --------
+                if not lr_flag or st["mode"] == 0:
+                    grad = param.grad
                     if grad is None:
                         continue
                     if grad.is_sparse:
                         raise RuntimeError("AdamLoraPre does not support sparse gradients")
-                else:
-                    grad = None
 
-                state["step"] += 1
-                t = state["step"]
+                    if weight_decay != 0.0:
+                        param.data.add_(param.data, alpha=-lr * weight_decay)
 
-                if weight_decay != 0.0:
-                    p.data.add_(p.data, alpha=-lr * weight_decay)
+                    exp_avg = st["exp_avg"]
+                    exp_avg_sq = st["exp_avg_sq"]
 
-                if is_vector:
-                    exp_avg = state["exp_avg"]
-                    exp_avg_sq = state["exp_avg_sq"]
-
-                    grad_fp = grad
-
+                    g = grad
                     if max_grad_norm is not None:
-                        g_norm = grad_fp.norm()
+                        g_norm = g.norm()
                         if g_norm > max_grad_norm:
-                            grad_fp = grad_fp * (max_grad_norm / (g_norm + 1e-6))
+                            g = g * (max_grad_norm / (g_norm + 1e-6))
 
-                    exp_avg.mul_(beta1).add_(grad_fp, alpha=1.0 - beta1)
-                    exp_avg_sq.mul_(beta2).addcmul_(grad_fp, grad_fp, value=1.0 - beta2)
+                    exp_avg.mul_(beta1).add_(g, alpha=1.0 - beta1)
+                    exp_avg_sq.mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
 
-                    bias_correction1 = 1.0 - beta1**t
-                    bias_correction2 = 1.0 - beta2**t
+                    bias_correction1 = 1.0 - beta1**self.oft_step
+                    bias_correction2 = 1.0 - beta2**self.oft_step
                     step_size = lr * math.sqrt(bias_correction2) / bias_correction1
 
                     denom = exp_avg_sq.sqrt().add_(eps)
-
-                    # producer_stream = torch.cuda.current_stream(p.device)
-                    # producer_event = torch.cuda.Event()
-                    # producer_event.record(producer_stream)
-                    #
-                    # self.worker.send(
-                    #     finish_adam,
-                    #     producer_event, p.cpu_fp16,
-                    #     exp_avg, denom,
-                    #     step_size,
-                    # )
-
-                    p.addcdiv_(exp_avg, denom, value=-step_size)
+                    param.addcdiv_(exp_avg, denom, value=-step_size)
                     continue
 
-                out_dim, in_dim = state["shape_2d"]
-                m_b_prev = state["m_B"]
-                m_a_prev = state["m_A"]
-                v_b_prev = state["v_B"]
-                v_a_prev = state["v_A"]
+                # -------- low-rank sketch path --------
+                g_sk = getattr(param, "grad_lr", None)
+                proj: SketchMatrixGenerator = getattr(param, "lr_proj", None)
 
-                if lr_flag:
-                    g_sk = getattr(p, "grad_lr", None)
-                    proj: SketchMatrixGenerator = getattr(p, "lr_proj", None)
-                    if g_sk is None:
-                        if proj is not None:
-                            proj.bump_seed()
-                        continue
+                if g_sk is None:
+                    if proj is not None:
+                        proj.bump_seed()
+                    continue
+                if proj is None:
+                    raise RuntimeError("Low-rank parameter is missing lr_proj")
 
-                    p_mat = proj.materialize_p(device=p.device, dtype=torch.float16)
+                out_dim, in_dim = st["shape_2d"]
+                k = st["sketch_rank"]
 
-                    gram = p_mat.T.float() @ p_mat.float()
-                    gram.diagonal().add_(cholesky_eps)
-                    l_p = safe_cholesky(gram, cholesky_eps)[0]
+                # materialize P once
+                P = proj.materialize_p(device=param.device, dtype=torch.float16)  # (in_dim, k)
 
-                    h = torch.cholesky_solve(g_sk.T.float(), l_p, upper=False).T.to(p_mat.dtype)
+                # fp32 ONLY here: metric correction
+                G = (P.T.float() @ P.float())
+                G.diagonal().add_(cholesky_eps)
+                L, _ = safe_cholesky(G, cholesky_eps)
 
-                    g2d = h @ p_mat.T
-
-                    if "m_B_pinned" not in state:
-                        state["m_B_pinned"] = torch.empty_like(m_b_prev, device=p.cpu_fp16.device, pin_memory=True)
-                    if "m_A_pinned" not in state:
-                        state["m_A_pinned"] = torch.empty_like(m_a_prev, device=p.cpu_fp16.device, pin_memory=True)
-                    if "v_B_pinned" not in state:
-                        state["v_B_pinned"] = torch.empty_like(v_b_prev, device=p.cpu_fp16.device, pin_memory=True)
-                    if "v_A_pinned" not in state:
-                        state["v_A_pinned"] = torch.empty_like(v_a_prev, device=p.cpu_fp16.device, pin_memory=True)
-                    if "h_pinned" not in state:
-                        state["h_pinned"] = torch.empty_like(h, device=p.cpu_fp16.device, pin_memory=True)
-                else:
-                    g2d = grad.view(out_dim, in_dim)
+                g = torch.cholesky_solve(g_sk.T.float(), L, upper=False).T.to(dtype=torch.float16)
 
                 if max_grad_norm is not None:
-                    g_norm = g2d.norm()
+                    g_norm = g.norm()
                     if g_norm > max_grad_norm:
-                        g2d = g2d * (max_grad_norm / (g_norm + 1e-6))
+                        g = g * (max_grad_norm / (g_norm + 1e-6))
 
-                m_a_cov = m_a_prev.float() @ m_a_prev.T.float()
-                l_a = safe_cholesky(m_a_cov, cholesky_eps)[0]
+                exp_avg_lr = st["exp_avg_lr"]
+                exp_avg_sq_lr = st["exp_avg_sq_lr"]
 
-                rhs_b_t = g2d @ m_a_prev.T
-                b_star_t = torch.cholesky_solve(rhs_b_t.T.float(), l_a, upper=False).to(m_a_prev.dtype)
-                b_star = b_star_t.T
+                exp_avg_lr.mul_(beta1).add_(g, alpha=1.0 - beta1)
+                exp_avg_sq_lr.mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
 
-                m_b_cov = m_b_prev.T.float() @ m_b_prev.float()
-                l_b = safe_cholesky(m_b_cov, cholesky_eps)[0]
-
-                rhs_a = m_b_prev.T @ g2d
-                a_star = torch.cholesky_solve(rhs_a.float(), l_b, upper=False).to(m_b_prev.dtype)
-
-                m_b = gamma1 * m_b_prev + (1.0 - gamma1) * b_star
-                m_a = gamma1 * m_a_prev + (1.0 - gamma1) * a_star
-
-                state["m_B"] = m_b
-                state["m_A"] = m_a
-
-                g_abs = g2d.abs()
-
-                v_a_cov = v_a_prev.float() @ v_a_prev.T.float()
-                l_av = safe_cholesky(v_a_cov, cholesky_eps)[0]
-
-                rhs_bv_t = g_abs @ v_a_prev.T
-                bv_star_t = torch.cholesky_solve(rhs_bv_t.T.float(), l_av, upper=False).to(v_a_prev.dtype)
-                bv_star = bv_star_t.T
-
-                v_b_cov = v_b_prev.T.float() @ v_b_prev.float()
-                l_bv = safe_cholesky(v_b_cov, cholesky_eps)[0]
-
-                rhs_av = v_b_prev.T @ g_abs
-                av_star = torch.cholesky_solve(rhs_av.float(), l_bv, upper=False).to(v_b_prev.dtype)
-
-                v_b = gamma2 * v_b_prev + (1.0 - gamma2) * bv_star
-                v_a = gamma2 * v_a_prev + (1.0 - gamma2) * av_star
-
-                state["v_B"] = v_b
-                state["v_A"] = v_a
-
-                bias_correction1 = 1.0 - beta1**t
-                bias_correction2 = 1.0 - beta2**t
+                bias_correction1 = 1.0 - beta1**self.oft_step
+                bias_correction2 = 1.0 - beta2**self.oft_step
                 step_size = lr * math.sqrt(bias_correction2) / bias_correction1
 
-                if lr_flag and match_energy:
-                    # energy correction
-                    k = p.lr_sketch_rank
+                if match_energy:
                     step_size *= math.sqrt(in_dim / k)
 
-                # if lr_flag and hasattr(p, "cpu_fp16"):
-                #     producer_stream = torch.cuda.current_stream(p.device)
-                #     producer_event = torch.cuda.Event()
-                #     producer_event.record(producer_stream)
-                #
-                #     self.worker.send(
-                #         finish_lora_pre,
-                #         producer_event, p.cpu_fp16,
-                #         m_a_prev, m_b_prev,
-                #         v_a_prev, v_b_prev,
-                #         h, p.lr_proj.copy(),
-                #         state["m_A_pinned"], state["m_B_pinned"],
-                #         state["v_A_pinned"], state["v_B_pinned"],
-                #         state["h_pinned"],
-                #         out_dim, in_dim,
-                #         beta1, beta2,
-                #         eps, step_size,
-                #         key=p,
-                #     )
+                denom_lr = exp_avg_sq_lr.sqrt().add_(eps)
+                delta_h = exp_avg_lr / denom_lr
+                delta_h.mul_(-step_size)  # (out_dim, k) in param.dtype
 
-                w_mat = p.data.view(out_dim, in_dim)
+                delta_w = delta_h.to(dtype=torch.float16) @ P.T  # (out_dim, in_dim) fp16
 
-                m_prev_full = m_b_prev @ m_a_prev
-                v_prev_full = v_b_prev @ v_a_prev
+                # update GPU fp8 param via fp16 round-trip + rescale
+                w_mat = param.data.view(out_dim, in_dim)
+                w_fp16 = fp8_to_fp16_with_scale(w_mat, param.fp8_scale)
 
-                m_t = beta1 * m_prev_full + (1.0 - beta1) * g2d
-                v_t = beta2 * v_prev_full.square() + (1.0 - beta2) * g2d.square()
+                if weight_decay != 0.0:
+                    w_fp16.mul_(1.0 - lr * weight_decay)
 
-                denom = v_t.sqrt_().add_(eps)
+                w_fp16.add_(delta_w)
+                res, param.fp8_scale = fp16_to_fp8_with_rescaling(w_fp16)
+                w_mat.copy_(res)
 
-                if lr_flag and hasattr(p, "cpu_fp16"):
-                    producer_stream = torch.cuda.current_stream(p.device)
+                # async update CPU master, and gate refresh by cpu_ready_evt
+                if hasattr(param, "cpu_fp16"):
+                    cpu_ready_evt: threading.Event = st["cpu_ready_evt"]
+                    cpu_ready_evt.clear()
+
+                    producer_stream = torch.cuda.current_stream(param.device)
                     producer_event = torch.cuda.Event()
                     producer_event.record(producer_stream)
 
                     self.worker.send(
-                        finish_lora_pre_v2,
-                        producer_event, p.cpu_fp16,
-                        m_t, denom,
-                        out_dim, in_dim,
-                        step_size,
+                        AdamLoraPre._finish_in_subspace_update_and_signal,
+                        producer_event,
+                        param.cpu_fp16,
+                        delta_w,
+                        out_dim,
+                        in_dim,
+                        lr,
+                        weight_decay,
+                        cpu_ready_evt,
+                        key=param,
                     )
 
-                w_mat.copy_(w_mat.float().addcdiv(m_t, denom, value=-step_size).to(w_mat))
-                if lr_flag and hasattr(p, "lr_proj"):
-                    p.lr_proj.bump_seed()
+                param.grad_lr = None
+                proj.bump_seed()
+
+        if self._refresh_k > 0:
+            self._refresh_from_cpu()
 
         return loss
 
@@ -822,162 +879,49 @@ def safe_cholesky(a, base_eps, max_tries=6):
     return l, eps
 
 
-def finish_lora_pre_v2(
-    producer_event, p_cpu,
-    m_t, denom,
-    out_dim, in_dim,
-    step_size,
-):
-    cpu_device = p_cpu.device
+def fp8_to_fp16_with_scale(
+    w_fp8: torch.Tensor,
+    scale: torch.Tensor,
+    out_device: torch.device | str = None,
+    *,
+    axis_muliscale: bool = True,
+    scale_dim: int = 0,
+) -> torch.Tensor:
+    w_fp16 = w_fp8.to(device=out_device, dtype=torch.float16)
 
-    consumer_stream = torch.cuda.current_stream()
-    consumer_stream.wait_event(producer_event)
+    if axis_muliscale:
+        broadcast_shape = [1] * w_fp16.ndim
+        broadcast_shape[scale_dim] = -1
+        return w_fp16 * scale.view(broadcast_shape)
 
-    m_t = m_t.to(cpu_device)
-    denom = denom.to(cpu_device)
-
-    done = torch.cuda.Event()
-    done.record(consumer_stream)
-    done.synchronize()
-
-    w_mat = p_cpu.data.view(out_dim, in_dim)
-
-    w_mat.addcdiv_(m_t, denom, value=-step_size)
+    return w_fp16 * scale
 
 
-def finish_lora_pre(
-    producer_event, p_cpu,
-    m_a_prev, m_b_prev,
-    v_a_prev, v_b_prev,
-    h, lr_proj,
-    m_a_pinned, m_b_pinned,
-    v_a_pinned, v_b_pinned,
-    h_pinned,
-    out_dim, in_dim,
-    beta1, beta2,
-    eps, step_size,
-):
-    cpu_device = p_cpu.device
+def fp16_to_fp8_with_rescaling(
+    w_fp16: torch.Tensor,
+    out_device: torch.device | str = None,
+    *,
+    axis_muliscale: bool = True,
+    scale_dim: int = 0,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    fp8_max = torch.finfo(torch.float8_e4m3fnuz).max
 
-    consumer_stream = torch.cuda.current_stream()
-    consumer_stream.wait_event(producer_event)
+    if axis_muliscale:
+        reduce_dims = [d for d in range(w_fp16.ndim) if d != scale_dim % w_fp16.ndim]
+        amax = w_fp16.abs().amax(dim=reduce_dims)
+    else:
+        amax = w_fp16.abs().max()
 
-    m_a_prev = m_a_pinned.copy_(m_a_prev, non_blocking=True)
-    m_b_prev = m_b_pinned.copy_(m_b_prev, non_blocking=True)
-    v_a_prev = v_a_pinned.copy_(v_a_prev, non_blocking=True)
-    v_b_prev = v_b_pinned.copy_(v_b_prev, non_blocking=True)
-    h = h_pinned.copy_(h, non_blocking=True)
+    scale = (amax / fp8_max).clamp(min=eps)
 
-    done = torch.cuda.Event()
-    done.record(consumer_stream)
-    done.synchronize()
+    if axis_muliscale:
+        broadcast_shape = [1] * w_fp16.ndim
+        broadcast_shape[scale_dim] = -1
+        w_scaled = w_fp16 / scale.view(broadcast_shape)
+    else:
+        w_scaled = w_fp16 / scale
 
-    g2d = h @ lr_proj.materialize_p(cpu_device, torch.float16).T
-    w_mat = p_cpu.data.view(out_dim, in_dim)
-
-    m_prev_full = m_b_prev @ m_a_prev
-    v_prev_full = v_b_prev @ v_a_prev
-
-    m_t = beta1 * m_prev_full + (1.0 - beta1) * g2d
-    v_t = beta2 * v_prev_full.square() + (1.0 - beta2) * g2d.square()
-
-    denom = v_t.sqrt_().add_(eps)
-    w_mat.addcdiv_(m_t, denom, value=-step_size)
-
-
-def finish_adam(
-    producer_event, p_cpu,
-    exp_avg, denom,
-    step_size,
-):
-    consumer_stream = torch.cuda.current_stream()
-    consumer_stream.wait_event(producer_event)
-
-    done = torch.cuda.Event()
-    done.record(consumer_stream)
-    done.synchronize()
-
-    w_mat = p_cpu.data
-
-    w_mat.addcdiv_(exp_avg.to(w_mat), denom.to(w_mat), value=-step_size)
-
-
-class Fp8RefreshScheduler:
-    """
-    Refresh ~N/K parameters per optimizer step from CPU fp16 masters onto GPU fp8 params,
-    without replacement across each K-step cycle.
-
-    Assumes: p.cpu_fp16 is already pinned CPU memory (so non_blocking H2D is meaningful).
-    """
-
-    def __init__(self, params, K: int, seed: int = 0, stream=None):
-        assert K >= 1
-        self.params = self._dedup([
-            p for p in params
-            if hasattr(p, "cpu_fp16")
-        ])
-        self.N = len(self.params)
-        self.K = K
-
-        self._gen = torch.Generator(device="cpu")
-        self._gen.manual_seed(seed)
-
-        self._cycle_step = 0
-        self._perm = []
-
-        self.stream = stream if stream is not None else torch.cuda.Stream()
-        self._done = torch.cuda.Event()
-
-        self._new_cycle()
-
-    def _dedup(self, ps):
-        seen = set()
-        out = []
-        for p in ps:
-            i = id(p)
-            if i in seen:
-                continue
-            seen.add(i)
-            out.append(p)
-        return out
-
-    def _new_cycle(self):
-        self._cycle_step = 0
-        if self.N == 0:
-            self._perm = []
-        else:
-            self._perm = torch.randperm(self.N, generator=self._gen).tolist()
-
-    def step(self):
-        if self.N == 0:
-            return
-
-        if self._cycle_step >= self.K:
-            self._new_cycle()
-
-        s = self._cycle_step
-        self._cycle_step += 1
-
-        start = (s * self.N) // self.K
-        end = ((s + 1) * self.N) // self.K
-
-        if start >= end:
-            # empty slice this step (common when K > N)
-            with torch.cuda.stream(self.stream):
-                pass
-            self._done.record(self.stream)
-            return
-
-        idxs = self._perm[start:end]
-
-        with torch.cuda.stream(self.stream):
-            for i in idxs:
-                p = self.params[i]      # fp8 param on GPU
-                src = p.cpu_fp16        # pinned fp16 master on CPU
-                p.data.copy_(
-                    src.to(device=p.device, dtype=p.dtype, non_blocking=True),
-                    non_blocking=True,
-                )
-
-        self._done.record(self.stream)
-        torch.cuda.current_stream().wait_event(self._done)
+    w_scaled.clamp_(-fp8_max, fp8_max)
+    w_fp8 = w_scaled.to(device=out_device, dtype=torch.float8_e4m3fnuz)
+    return w_fp8, scale

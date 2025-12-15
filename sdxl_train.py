@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 import torch
 from library.device_utils import init_ipex, clean_memory_on_device
-from lora_pre import Fp8RefreshScheduler
+from lora_pre import fp16_to_fp8_with_rescaling
 
 init_ipex()
 
@@ -479,9 +479,6 @@ def train(args):
         text_encoder1.text_model.encoder.layers[-1].requires_grad_(False)
         text_encoder1.text_model.final_layer_norm.requires_grad_(False)
 
-    fp8_refresher = None
-    optimizer.register_step_post_hook(lambda *args, **kwargs: fp8_refresher.step())
-
     if args.deepspeed:
         ds_model = deepspeed_utils.prepare_deepspeed_model(
             args,
@@ -534,13 +531,11 @@ def train(args):
     for m in (unet, text_encoder1, text_encoder2):
         for p_name, p in m.named_parameters():
             if hasattr(p, "cpu_fp16"):
-                p.data = p.data.to(dtype=torch.float8_e4m3fnuz)
+                p.data, p.fp8_scale = fp16_to_fp8_with_rescaling(p.data)
 
     torch.cuda.synchronize()
     gc.collect()
     torch.cuda.empty_cache()
-
-    fp8_refresher = Fp8RefreshScheduler((*unet.parameters(), *text_encoder1.parameters(), *text_encoder2.parameters()), args.cpu_refresh_ttl)
 
     # 実験的機能：勾配も含めたfp16学習を行う　PyTorchにパッチを当ててfp16でのgrad scaleを有効にする
     if args.full_fp16:
@@ -650,6 +645,7 @@ def train(args):
         accelerator, args, 0, global_step, accelerator.device, vae, [tokenizer1, tokenizer2], [text_encoder1, text_encoder2], unet
     )
 
+    more_global_step = 0
     loss_recorder = train_util.LossRecorder()
     for epoch in range(num_train_epochs):
         gc.collect()
@@ -861,13 +857,14 @@ def train(args):
                 else:
                     append_block_lr_to_logs(block_lrs, logs, lr_scheduler, args.optimizer_type)  # U-Net is included in block_lrs
 
-                accelerator.log(logs, step=global_step)
+                accelerator.log(logs, step=more_global_step)
 
             loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
             avr_loss: float = loss_recorder.moving_average
             logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
+            more_global_step += 1
             if global_step >= args.max_train_steps:
                 break
 
@@ -931,6 +928,7 @@ def train(args):
         for p in m.parameters():
             if hasattr(p, "cpu_fp16"):
                 p.data = p.cpu_fp16.to(p.device)
+                del p.fp8_scale
 
     if is_main_process:
         src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
@@ -1010,11 +1008,6 @@ def setup_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--sketches_ttl",
-        type=int,
-        default=200,
-    )
-    parser.add_argument(
-        "--cpu_refresh_ttl",
         type=int,
         default=200,
     )
